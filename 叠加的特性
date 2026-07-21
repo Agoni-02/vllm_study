@@ -11,3 +11,4 @@
   },
   "enable_balance_scheduling": true
 }
+  --enable-prefix-caching \
