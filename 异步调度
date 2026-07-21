@@ -1,0 +1,784 @@
+异步调度日志定位指南md
+2026-07-09 12:08 由 夏迎庆 00954016 创建，于 2026-07-09 12:08 由 夏迎庆 00954016 最后修改。 内容存疑 点我
+异步调度（Async Scheduling）— 日志定位指南
+这是什么：vLLM 异步调度将 CPU 调度与 GPU/NPU 模型执行解耦，通过乐观假设+事后修正实现调度与执行的流水线重叠，消除 GPU 空闲 bubble。本指南覆盖 vLLM 上游 + vLLM-Ascend 下游的完整异步调度链路。
+
+覆盖范围：从 async_scheduling 配置决策 → 调度器/Executor 初始化 → 调度循环（schedule → execute → update）→ 异步输出修正 → 异常恢复/Preemption/Recompute
+
+涉及组件：Scheduler / AsyncScheduler（上游）、RecomputeScheduler / AsyncRecomputeScheduler（Ascend）、GPUModelRunner / NPUModelRunnerV1、Executor（详见 附录 A）
+
+术语	含义
+num_output_placeholders	异步调度核心字段：乐观假设本轮会生成的 token 数，调度时 +N，结果返回后 −N（实际值）
+async_tokens_to_discard	Preemption 时需要丢弃的 stale 异步输出帧计数
+prev_sampled_token_ids	上一轮 decode 的采样 token（留在 GPU/NPU 上，不经过 CPU 拷贝）
+valid_sampled_token_count	跨 step 传递的实际接受 token 数（推测解码场景用于 draft 拒绝修正）
+prev_num_draft_len	上一轮调度了多少 draft token（推测解码场景）
+batch_queue	双缓冲队列，大小为 2（异步调度）或 PP size
+Recompute	vLLM-Ascend 特有：拓扑重计算调度，抢占时将请求送回 PD Proxy 重计算
+KV Load Failure	KV cache block 加载失败（如 NIXL 传输失败），需回退或 fail 请求
+你需要准备：
+
+日志文件：
+标准输出（含 vllm logger 的 INFO/DEBUG 日志）
+vLLM-Ascend 文件日志：~/ascend/log/vllm_ascend/ 目录下的轮转日志
+快速过滤：
+# 通用异步调度关键日志
+grep -nE "(Asynchronous scheduling is|Batch queue is enabled|num_output_placeholders|KV load failure|Recompute.*triggered|Recompute.*[Pp]reempt)" <日志文件>
+# vllm-ascend 专用
+grep -nE "\[RecomputeScheduler\]" <日志文件>
+​
+阅读优先级：紧急排障 → 直接看下方「判断口诀」；系统了解 → 按 §一 → §二 → 附录顺序读
+
+目录
+一、快速定位（先看这里）
+二、分阶段详细定位
+2.1 阶段 1：配置决策与组件初始化
+2.2 阶段 2：调度循环（Schedule）
+2.3 阶段 3：模型执行与异步输出
+2.4 阶段 4：结果更新与乐观修正
+2.5 阶段 5：异常与故障恢复
+三、卡点速查（卡在 X → 查 Y）
+四、附录
+A. 涉及仓库与组件
+B. 关键配置
+C. 全量日志逐步明细
+D. 全量流程图（Mermaid）
+E. 关键节点索引
+F. 故障场景流程
+一、快速定位（先看这里）
+30 秒速判：在日志里搜下面几步的标志日志，最后出现的那条 = 你卡在哪一步，直接跳对应 §二或 §三。
+
+步骤	标志日志（grep 关键字）	走到了哪个阶段	正常应接着看到	没走到 →	备查（表 → 图）
+1	Asynchronous scheduling is enabled	配置决策完成	Batch queue is enabled 或直接进入调度循环	§三“异步调度未启用”	C.1 → D.1
+2	Batch queue is enabled with size	双缓冲队列就绪	EngineCore loop active，进入调度	§三“batch_queue 未创建”	C.1 → D.1
+3	EngineCore loop active	主循环运行中	正常的 request 生命周期日志	§2.2 / §三“卡在调度”	C.2 → D.2
+4	Finished recving KV transfer / Finished sending KV transfer	KV 传输完成	请求正常结束或有新 token 输出	§三“KV 传输卡住”	C.3 → D.3
+5	Recovered from KV load failure / Failing ... request(s) due to KV load failure	KV 加载异常处理	恢复后继续调度 / 请求失败	§三“KV 加载失败”	C.5 → D.5
+判断口诀：
+
+搜 enabled → 没搜到 = 配置没走到（查 --async-scheduling 和自动禁用条件）
+搜 Batch queue → 没搜到 = 单 batch 模式（batch_queue_size=1，异步未生效）
+搜 RecomputeScheduler → Ascend 专用路径（查 recompute 抢占/重算）
+搜 KV load failure → KV 传输异常（查 NIXL/Mooncake 连接器状态）
+搜 Recovered from KV → 自动恢复成功（可忽略，关注是否频繁出现）
+搜 Failing ... due to KV → 请求已被 fail（需排查 KV 传输根因）
+​
+配置决策
+
+组件初始化
+
+调度循环
+
+模型执行
+
+结果修正
+
+异常恢复
+
+跨阶段图链接：D.5 时序图 · D.6 状态图 · F 故障场景
+
+二、分阶段详细定位
+2.1 阶段 1：配置决策与组件初始化
+在干什么：vLLM 启动时根据配置和运行环境自动决定是否启用异步调度，然后初始化 Scheduler、Executor、batch_queue。
+
+子环节表：
+
+子环节	关键日志	正常含义	异常时/分支
+显式启用检查	（无日志，直接通过）	--async-scheduling 显式设为 True	不兼容配置直接 raise ValueError，进程退出
+自动决策	Asynchronous scheduling is enabled.	默认（None）且无冲突，自动启用	见下方禁用原因表
+自动禁用（pooling）	Disabling asynchronous scheduling by default for pooling model. (DEBUG)	Pooling 模型性能反降，自动关闭	确认是否确实为 pooling 模型
+自动禁用（spec decode）	Async scheduling not supported with %s-based speculative decoding and will be disabled. (WARNING)	不支持的推测解码方法	改用 EAGLE/MTP/Draft Model/NGram GPU
+自动禁用（padded batch）	Async scheduling is not compatible with disable_padded_drafter_batch=True and will be disabled. (WARNING)	padded drafter batch 未启用	移除 disable_padded_drafter_batch
+自动禁用（executor）	Async scheduling will be disabled because it is not supported with the \%s` distributed executor backend.` (WARNING)	Executor 不支持异步调度	换用 mp/uni proc executor
+自动禁用（ROCm）	Async scheduling is disabled for ROCm DeepEP high-throughput DBO... (WARNING)	ROCm DeepEP HT DBO 不兼容	换 all2all backend
+batch_queue 创建	Batch queue is enabled with size %d (DEBUG)	max_concurrent_batches > 1，双缓冲就绪	如果没搜到这句，且 async=enabled，说明 max_concurrent_batches=1
+Scheduler 选择	（无日志）	vLLM 上游用 AsyncScheduler；Ascend 用 AsyncRecomputeScheduler	见 附录 A
+定位注意：
+
+如果日志中搜不到 Asynchronous scheduling is enabled.，检查是否被某个自动禁用条件命中（搜 will be disabled / Disabling asynchronous）
+Batch queue is enabled with size 是 DEBUG 级别，默认日志级别可能看不到——需要设置 VLLM_LOGGING_LEVEL=DEBUG 或检查代码中 max_concurrent_batches 的值
+→ 全量表：C.1
+→ 全量流程图：D.1
+
+2.2 阶段 2：调度循环（Schedule）
+在干什么：每个 step 中，Scheduler 从 WAITING 队列取请求、分配 KV cache blocks、乐观增加 num_output_placeholders、生成 SchedulerOutput。
+
+子环节表：
+
+子环节	关键日志	正常含义	异常时/分支
+WAITING→RUNNING	（无 INFO 日志，仅内部状态变更）	请求成功调度	若请求一直在 WAITING，查 KV cache 是否满
+WAITING_FOR_REMOTE_KVS	%s is still in WAITING_FOR_REMOTE_KVS state. (DEBUG)	远端 KV 尚未传输完成，等待中	多次出现表示 KV 传输慢或卡住
+乐观占位	（无日志）	AsyncScheduler._update_after_schedule() 增加 num_output_placeholders	占位计数异常会导致 num_computed_tokens 计算错误
+Preemption（上游）	（无专门日志）	资源不足时抢占低优先级请求	见阶段 5
+Preemption（Ascend）	[RecomputeScheduler] Preempted request %s. running_count=%s, token_budget=%s (INFO)	Recompute 模式下抢占请求	频繁出现说明 KV cache 不足
+Recompute Offload	Recompute preemption offload enabled for request %s, computed_tokens=%d. (INFO)	抢占的请求被 offload 到远端	正常
+Recompute Fallback	Recompute preemption falls back without offload for request %s, computed_tokens=%d. (INFO)	Offload 失败，请求送回 PD Proxy 重计算	需关注是否频繁出现
+定位注意：
+
+异步调度核心字段 num_output_placeholders 没有日志输出。如果怀疑占位逻辑有问题，需要加临时的 debug 日志或在 AsyncScheduler._update_after_schedule 和 _update_request_with_output 中打印 num_output_placeholders 值
+async_tokens_to_discard 也没有日志。如果 force-preempt 后输出错乱，这是首要排查点
+→ 全量表：C.2
+→ 全量流程图：D.2
+
+2.3 阶段 3：模型执行与异步输出
+在干什么：GPU/NPU 执行模型 forward + sample，execute_model() 返回 AsyncModelRunnerOutput（一个“承诺”），实际 GPU→CPU 拷贝在独立 stream 上异步进行。
+
+子环节表：
+
+子环节	关键日志	正常含义	异常时/分支
+模型加载	Starting to load model %s... (INFO) / Loading model weights took %.4f GB (INFO)	模型权重加载完成	卡住说明模型加载失败
+输入准备	（无日志）	_prepare_input_ids 处理 batch 组成变化	prev_sampled_token_ids 在 GPU 上直接拷贝
+CUDA Graph 捕获	Profiling CUDA graph memory: %s (INFO)	CUDA Graph 编译完成	卡住可能是显存不足
+KV Cache 复用	%s reuses KV cache of %s (DEBUG)	层间 KV cache 共享	正常
+异步输出 get_output()	（无日志）	阻塞等待 GPU→CPU 拷贝完成	如果长时间不返回，说明 GPU→CPU 拷贝或 stream 同步卡住
+定位注意：
+
+AsyncModelRunnerOutput.get_output() 是阻塞调用，没有任何超时日志。如果卡住，只能通过外部超时（如心跳超时）发现
+prev_sampled_token_ids 在 GPU 上的拷贝、valid_sampled_token_count 异步拷贝均在独立 stream 上，错误不会立刻暴露
+vLLM-Ascend 将 valid_sampled_token_count_cpu dtype 修正为 torch.int64（上游可能用 int32），如果 dtype 不匹配会导致静默数值错误
+→ 全量表：C.3
+→ 全量流程图：D.3
+
+2.4 阶段 4：结果更新与乐观修正
+在干什么：update_from_output() 处理模型输出，修正 num_output_placeholders、处理 KV connector 状态、处理 stream 输出、generation stopped。
+
+子环节表：
+
+子环节	关键日志	正常含义	异常时/分支
+KV 接收完成	Finished recving KV transfer for request %s (DEBUG)	远端 KV 传输完成，请求可调度	没有此日志说明 KV 传输未完成
+KV 发送完成	Finished sending KV transfer for request %s (DEBUG)	本地 KV 已发送，可释放 blocks	正常
+占位修正	（无日志）	request.num_output_placeholders -= len(new_token_ids)	如果减去后 <0 触发 assert
+Grammar 拒绝	Unexpected: grammar rejected tokens %s for request %s. Terminating request. (ERROR)	structured output 语法校验失败，请求被终止	关注请求的 grammar 定义是否正确
+Grammar 拒绝（Ascend）	[RecomputeScheduler] Unexpected: grammar rejected tokens %s for request %s. Terminating request. (ERROR)	同上，Ascend 路径	同上
+Recompute 触发	[RecomputeScheduler] Recompute triggered for request %s. (WARNING)	请求被送回 PD Proxy 重计算	关注频率，频繁触发说明调度压力大
+→ 全量表：C.4
+→ 全量流程图：D.4
+
+2.5 阶段 5：异常与故障恢复
+在干什么：处理 KV cache block 加载失败、reset_prefix_cache、connector 重置、shutdown。
+
+子环节表：
+
+子环节	关键日志	正常含义	异常时/分支
+KV 加载失败（fail）	Failing %d request(s) due to KV load failure (failure_policy=fail, %d tokens affected). Request IDs: %s (ERROR)	failure_policy=fail 时直接终止请求	排查 KV 传输链路（NIXL/Mooncake）
+KV 加载失败（恢复）	Recovered from KV load failure: %d request(s) rescheduled (%d tokens affected). (WARNING)	自动恢复成功，请求重新调度	如果频繁出现需要排查 KV 传输稳定性
+Connector 无操作	reset_connector requested but no KV connector is configured; treating as no-op success. (DEBUG)	未配置 KV connector 时 reset 请求无影响	正常
+Shutdown 开始	[shutdown] Scheduler: start (DEBUG)	调度器开始关闭	—
+Shutdown 完成	[shutdown] Scheduler: complete (DEBUG)	调度器正常关闭	—
+EngineCore Shutdown	[shutdown] EngineCore: tearing down local resources / local resource teardown complete (DEBUG)	引擎正常关闭	—
+→ 全量表：C.5
+→ 全量流程图：D.5
+
+三、卡点速查（卡在 X → 查 Y）
+你卡在这里	落在哪个大阶段	优先查什么	常见原因
+启动后没有 Asynchronous scheduling is enabled	阶段1	搜 will be disabled / Disabling	pooling 模型、不兼容的 spec decode 方法、executor 不支持
+有 enabled 但没有 Batch queue is enabled	阶段1	检查 max_concurrent_batches 值	PP size=1 且非异步调度时 batch_queue_size=1，不打印 DEBUG 日志
+请求一直在 WAITING 不进入 RUNNING	阶段2	查 KV cache 使用率、WAITING_FOR_REMOTE_KVS 日志	KV cache 满、远端 KV 未到达
+请求被 Preempted（上游）	阶段2/5	查 token_budget 和 running_count 日志	KV cache 不足、请求优先级低
+请求被 Recompute Preempted（Ascend）	阶段2/5	搜 [RecomputeScheduler] Preempted	NPU 显存不足触发拓扑重计算抢占
+Recompute offload 失败	阶段2	搜 falls back without offload	KV connector offload 不可用
+模型执行卡住不返回	阶段3	查 GPU/NPU 是否 hung、是否有 CUDA/NPU 错误	CUDA Graph 捕获失败、显存不足、算子错误
+AsyncModelRunnerOutput.get_output() 超时	阶段3	查异步 stream 是否同步失败	CUDA/NPU stream 错误、event 未 record
+KV 传输一直不完成	阶段4	搜 WAITING_FOR_REMOTE_KVS、查 connector 日志	NIXL/Mooncake 连接异常、网络问题
+Failing ... due to KV load failure	阶段5	查 KV 传输链路完整日志	KV 传输失败 + failure_policy=fail
+Recovered from KV load failure 频繁出现	阶段5	查 NIXL/Mooncake 连接稳定性	间歇性网络抖动
+请求被 grammar 拒绝	阶段4	查 grammar rejected tokens 日志	structured output 语法与输出不匹配
+Shutdown 卡住	阶段5	查 connector/event_publisher shutdown 日志	KV connector 未正常关闭
+排查顺序（与 §一 步骤一致）：
+
+第1步：确认 async_scheduling 是否启用 → 搜 "Asynchronous scheduling is"
+第2步：确认 batch_queue 状态 → 搜 "Batch queue is enabled"
+第3步：确认调度循环是否正常 → 观察请求生命周期日志
+第4步：确认 KV 传输状态 → 搜 "Finished recving" / "KV load failure"
+第5步：确认是否有异常恢复 → 搜 "Recovered from" / "Recompute triggered"
+第6步（Ascend）：搜 "[RecomputeScheduler]" 系列日志
+​
+四、附录
+A. 涉及仓库与组件
+仓库/组件	文件	类/函数	说明
+vllm/config	vllm.py (L930-1028)	VllmConfig.__init__	异步调度自动决策逻辑
+vllm/config	scheduler.py (L158)	SchedulerConfig.async_scheduling	配置字段定义
+vllm/v1/core/sched	async_scheduler.py	AsyncScheduler	上游异步调度器（75行）
+vllm/v1/core/sched	scheduler.py	Scheduler	上游调度器基类（2648行）
+vllm/v1/engine	core.py (L196-224)	EngineCore.__init__	batch_queue 创建
+vllm/v1/executor	multiproc_executor.py	MultiprocExecutor	多进程执行器，supports_async_scheduling()=True
+vllm/v1/worker	gpu_model_runner.py	GPUModelRunner	GPU 模型运行器（~50 处 async_scheduling 分支）
+vllm/v1/request.py	request.py	Request	num_output_placeholders、async_tokens_to_discard
+vllm-ascend/core	recompute_scheduler.py	RecomputeScheduler / AsyncRecomputeScheduler	Ascend 调度器（1122行）
+vllm-ascend/worker	model_runner_v1.py	NPUModelRunnerV1	Ascend NPU 模型运行器
+vllm-ascend/patch/platform	patch_balance_schedule.py	BalanceScheduler	310P 平衡调度器
+vllm-ascend/core	scheduler_dynamic_batch.py	DynamicBatchScheduler	动态 batch 调度器
+vllm-ascend/core	scheduler_profiling_chunk.py	ProfilingChunkScheduler	Profiling chunk 调度器
+B. 关键配置
+配置项	日志体现	说明
+--async-scheduling / SchedulerConfig.async_scheduling	Asynchronous scheduling is enabled/disabled.	布尔/None；None 时自动决策
+max_concurrent_batches	Batch queue is enabled with size %d (DEBUG)	异步调度时 =2（双缓冲）
+VLLM_LOGGING_LEVEL	影响 DEBUG 级别日志的可见性	建议排查时设为 DEBUG
+scheduler_cls	（无日志）	Ascend 自动设为 AsyncRecomputeScheduler
+failure_policy (KV transfer)	failure_policy=fail 出现在 KV load failure 日志中	fail=终止请求；recompute=恢复重试
+kv_transfer_config.is_kv_producer / is_kv_consumer	（无日志）	影响 Ascend Recompute 抢占行为（consumer 端走 offload/recompute）
+disable_padded_drafter_batch	Async scheduling is not compatible with disable_padded_drafter_batch=True	必须为 False 才能启用异步调度
+C. 全量日志逐步明细
+阅读链：§一/§二 → 附录 C → 附录 D
+
+
+C.1 阶段 1：配置决策与组件初始化
+← §一步骤1·2 · §2.1 · 流程图 → #d1
+
+序号	子模块	日志原文	说明
+1	vllm/config/vllm.py	Disabling asynchronous scheduling by default for pooling model.	DEBUG。pooling 模型自动禁用
+2	vllm/config/vllm.py	Async scheduling not supported with %s-based speculative decoding and will be disabled.	WARNING。不支持的推测解码方法
+3	vllm/config/vllm.py	Async scheduling is not compatible with disable_padded_drafter_batch=True and will be disabled.	WARNING。padded batch 配置冲突
+4	vllm/config/vllm.py	Async scheduling will be disabled because it is not supported with the \%s` distributed executor backend.`	WARNING。Executor 不支持
+5	vllm/config/vllm.py	Async scheduling is disabled for ROCm DeepEP high-throughput DBO because that combination can corrupt DP+EP generation accuracy.	WARNING。ROCm 特定冲突
+6	vllm/config/vllm.py	Asynchronous scheduling is %s.	INFO。最终决策（enabled/disabled）。标志日志
+7	vllm/v1/engine/core.py	Batch queue is enabled with size %d	DEBUG。双缓冲就绪。仅在 max_concurrent_batches > 1 时打印
+→ 全量流程图：#d1
+
+
+C.2 阶段 2：调度循环（Schedule）
+← §一步骤3 · §2.2 · 流程图 → #d2
+
+序号	子模块	日志原文	说明
+8	vllm/v1/core/sched/scheduler.py	%s is still in WAITING_FOR_REMOTE_KVS state.	DEBUG。请求等待远端 KV 传输
+9	vllm-ascend/core/recompute_scheduler.py	[RecomputeScheduler] %s is still in WAITING_FOR_REMOTE_KVS state.	DEBUG。同上，Ascend 路径
+10	vllm-ascend/core/recompute_scheduler.py	[RecomputeScheduler] Preempted request %s. running_count=%s, token_budget=%s	INFO。Ascend Recompute 抢占。标志日志
+11	vllm-ascend/core/recompute_scheduler.py	Recompute preemption offload enabled for request %s, computed_tokens=%d.	INFO。Offload 成功
+12	vllm-ascend/core/recompute_scheduler.py	Recompute preemption falls back without offload for request %s, computed_tokens=%d.	INFO。Offload 失败，走 PD 重算
+→ 全量流程图：#d2
+
+
+C.3 阶段 3：模型执行与异步输出
+← §一步骤4 · §2.3 · 流程图 → #d3
+
+序号	子模块	日志原文	说明
+13	vllm-ascend/worker/model_runner_v1.py	Starting to load model %s...	INFO。模型加载开始
+14	vllm-ascend/worker/model_runner_v1.py	Loading model weights took %.4f GB	INFO。模型权重加载完成
+15	vllm/v1/worker/gpu_model_runner.py	Profiling CUDA graph memory: %s	INFO。CUDA Graph 编译
+16	vllm/v1/worker/gpu_model_runner.py	Initialized minimal KV cache for CUDA graph profiling	DEBUG。Profiling 前 KV cache 初始化
+17	vllm/v1/worker/gpu_model_runner.py	Cleaned up profiling KV cache and CUDA graphs	DEBUG。Profiling 清理
+18	vllm/v1/worker/gpu_model_runner.py	Finish execute for mm hash %s	DEBUG。多模态 execute 完成
+19	vllm-ascend/worker/model_runner_v1.py	%s reuses KV cache of %s	DEBUG。层间 KV cache 复用
+→ 全量流程图：#d3
+
+
+C.4 阶段 4：结果更新与乐观修正
+← §一步骤5 · §2.4 · 流程图 → #d4
+
+序号	子模块	日志原文	说明
+20	vllm/v1/core/sched/scheduler.py	Finished recving KV transfer for request %s	DEBUG。KV 接收完成
+21	vllm/v1/core/sched/scheduler.py	Finished sending KV transfer for request %s	DEBUG。KV 发送完成
+22	vllm/v1/core/sched/scheduler.py	Unexpected: grammar rejected tokens %s for request %s. Terminating request.	ERROR。Grammar 校验失败。标志日志
+23	vllm-ascend/core/recompute_scheduler.py	[RecomputeScheduler] Unexpected: grammar rejected tokens %s for request %s. Terminating request.	ERROR。同上，Ascend 路径
+24	vllm-ascend/core/recompute_scheduler.py	[RecomputeScheduler] Recompute triggered for request %s.	WARNING。请求送 PD Proxy 重计算。标志日志
+→ 全量流程图：#d4
+
+
+C.5 阶段 5：异常与故障恢复
+← §一步骤5 · §2.5 · 流程图 → #d5
+
+序号	子模块	日志原文	说明
+25	vllm/v1/core/sched/scheduler.py	Failing %d request(s) due to KV load failure (failure_policy=fail, %d tokens affected). Request IDs: %s	ERROR。KV 加载失败终止请求。标志日志
+26	vllm/v1/core/sched/scheduler.py	Recovered from KV load failure: %d request(s) rescheduled (%d tokens affected).	WARNING。KV 加载失败自动恢复
+27	vllm/v1/core/sched/scheduler.py	reset_connector requested but no KV connector is configured; treating as no-op success.	DEBUG。无 connector 时 reset 无影响
+28	vllm/v1/core/sched/scheduler.py	[shutdown] Scheduler: start	DEBUG。调度器关闭开始
+29	vllm/v1/core/sched/scheduler.py	[shutdown] Scheduler: complete	DEBUG。调度器关闭完成
+30	vllm/v1/engine/core.py	[shutdown] EngineCore: tearing down local resources	DEBUG。引擎关闭
+31	vllm/v1/engine/core.py	[shutdown] EngineCore: local resource teardown complete	DEBUG。引擎关闭完成
+→ 全量流程图：#d5
+
+D. 全量流程图（Mermaid）
+← 附录 C · §一/§二
+
+
+D.1 配置决策与组件初始化流程
+← 全量表 #c1
+
+组件初始化
+
+配置决策
+
+是
+
+否/None
+
+是
+
+否
+
+是
+
+否
+
+是
+
+否
+
+兼容
+
+不兼容
+
+是
+
+否
+
+读取 async_scheduling 配置
+
+async_scheduling
+显式设为 True?
+
+检查兼容性
+
+runner_type=pooling?
+
+[DEBUG] Disabling async scheduling
+by default for pooling model.
+
+speculative_config
+不兼容?
+
+[WARNING] Async scheduling not supported
+with %s-based speculative decoding
+
+executor 不支持?
+
+[WARNING] Async scheduling disabled
+because not supported with `%s`
+
+[INFO] Asynchronous scheduling
+is enabled.
+
+raise ValueError
+进程退出
+
+async_scheduling = False
+
+max_concurrent_batches > 1?
+
+[DEBUG] Batch queue is enabled
+with size %d
+
+batch_queue = None
+单 batch 模式
+
+创建 AsyncScheduler
+或 AsyncRecomputeScheduler
+
+
+D.2 调度循环流程（Schedule）
+← 全量表 #c2
+
+否
+
+是
+
+WAITING_FOR_REMOTE_KVS
+
+正常
+
+是
+
+否
+
+Recompute + Consumer
+
+是
+
+否
+
+其他
+
+schedule 开始
+
+有 WAITING 请求?
+
+仅调度 RUNNING 请求
+
+请求状态?
+
+[DEBUG] %s is still in
+WAITING_FOR_REMOTE_KVS state.
+
+跳过，放入 skipped_waiting
+
+分配 KV cache blocks
+
+资源充足?
+
+加入 scheduled_running_reqs
+
+调度策略?
+
+抢占 running 最后一个请求
+
+offload 成功?
+
+[INFO] Recompute preemption
+offload enabled for %s
+
+[INFO] Recompute preemption
+falls back without offload
+for %s
+
+[WARNING] Recompute triggered
+for request %s
+
+[INFO] [RecomputeScheduler]
+Preempted request %s
+
+AsyncScheduler._update_after_schedule()
+num_output_placeholders += N
+
+生成 SchedulerOutput
+
+schedule 结束
+
+
+D.3 模型执行与异步输出流程
+← 全量表 #c3
+
+是
+
+否
+
+是
+
+否
+
+EngineCore.step_with_batch_queue
+
+use_async_scheduling?
+
+batch_queue 双缓冲
+max 2 batches 并发
+
+同步执行
+单 batch
+
+prepare_inputs
+prev_sampled_token_ids GPU 拷贝
+
+Model Forward
+
+Sample
+
+num_spec_tokens > 0?
+
+valid_sampled_token_count
+异步 GPU→CPU 拷贝
+
+直接拷贝 sampled_token_ids
+
+返回 AsyncModelRunnerOutput
+get_output 阻塞等待
+
+update_from_output
+
+
+D.4 结果更新与乐观修正流程
+← 全量表 #c4
+
+是
+
+否
+
+是
+
+否
+
+是
+
+否
+
+拒绝
+
+通过
+
+是
+
+是
+
+否
+
+update_from_output 开始
+
+处理 KV connector output
+
+finished_recving?
+
+[DEBUG] Finished recving KV
+transfer for request %s
+
+finished_sending?
+
+[DEBUG] Finished sending KV
+transfer for request %s
+
+逐请求处理 output
+
+new_token_ids 非空?
+
+_update_request_with_output()
+num_output_placeholders -= len(new_token_ids)
+
+pooling?
+
+grammar 检查
+
+[ERROR] Unexpected: grammar rejected
+tokens %s for request %s
+
+更新 token ids / stop check
+
+FINISHED_STOPPED
+
+recomputed_reqs 非空?
+
+[WARNING] [RecomputeScheduler]
+Recompute triggered for request %s
+
+结束
+
+
+D.5 异常与故障恢复流程
+← 全量表 #c5
+
+是
+
+是
+
+否
+
+是
+
+否
+
+是
+
+否
+
+KV load 异常
+
+invalid_block_ids?
+
+识别受影响请求
+调整 num_computed_tokens
+
+should_fail?
+failure_policy=fail?
+
+[ERROR] Failing %d request(s)
+due to KV load failure
+Request IDs: %s
+
+[WARNING] Recovered from KV
+load failure: %d request(s)
+rescheduled
+
+请求 FINISHED_ERROR
+
+failed_recving_kv_req_ids
+标记重试
+
+Shutdown
+
+[DEBUG] [shutdown] Scheduler: start
+
+shutdown kv_event_publisher
+
+connector 存在?
+
+connector.shutdown
+
+ec_connector 存在?
+
+ec_connector.shutdown
+
+[DEBUG] [shutdown] Scheduler: complete
+
+
+D.6 异步调度数据流（sequenceDiagram）
+GPU/NPU
+ModelRunner(GPU/NPU)
+BatchQueue(双缓冲)
+AsyncScheduler
+EngineCore
+GPU/NPU
+ModelRunner(GPU/NPU)
+BatchQueue(双缓冲)
+AsyncScheduler
+EngineCore
+Step N（第一个 step，冷启动）
+Step N+1（CPU/GPU 重叠）
+batch_N 结果返回
+schedule()
+1
+_update_after_schedule()
+num_output_placeholders += N
+2
+SchedulerOutput
+3
+submit(batch_N)
+4
+execute_model(batch_N)
+5
+forward + sample
+6
+AsyncModelRunnerOutput
+7
+Future
+8
+schedule()（不等 batch_N 完成）
+9
+乐观假设 batch_N 生成 token
+num_output_placeholders 用于修正
+10
+SchedulerOutput
+11
+submit(batch_N+1)
+12
+get_output(batch_N)（阻塞）
+13
+event.synchronize()
+14
+sampled_token_ids
+15
+ModelRunnerOutput
+16
+update_from_output(batch_N)
+17
+_update_request_with_output()
+num_output_placeholders -= actual
+事后修正乐观假设
+18
+
+D.7 vLLM-Ascend AsyncRecomputeScheduler 继承关系
+Scheduler
+
++schedule()
+
++update_from_output()
+
++_update_after_schedule()
+
++_update_request_with_output()
+
+AsyncScheduler
+
++_update_after_schedule()
+
++_update_request_with_output()
+
+RecomputeScheduler
+
++schedule()
+
++update_from_output()
+
++_preempt_request()
+
+AsyncRecomputeScheduler
+
+（多重继承，无额外方法）
+
+E. 关键节点索引
+阶段	关键日志（grep 关键字）	说明
+配置	Asynchronous scheduling is enabled	异步调度启用的唯一 INFO 确认
+配置	will be disabled	自动禁用原因（WARNING 或 DEBUG）
+初始化	Batch queue is enabled	双缓冲就绪（DEBUG）
+调度	[RecomputeScheduler] Preempted request	Ascend 抢占事件（INFO）
+调度	Recompute preemption offload enabled	Offload 成功（INFO）
+调度	Recompute preemption falls back	Offload 失败回退（INFO）
+执行	Loading model weights took	模型加载完成（INFO）
+更新	Finished recving KV transfer	KV 接收完成（DEBUG）
+更新	Recompute triggered for request	PD 重计算触发（WARNING）
+异常	Failing ... request(s) due to KV load failure	KV 失败终止请求（ERROR）
+异常	Recovered from KV load failure	KV 失败自动恢复（WARNING）
+异常	grammar rejected tokens	Grammar 校验失败（ERROR）
+F. 故障场景流程
+F.1 异步调度未启用
+命中
+
+未命中
+
+命中
+
+未命中
+
+启动后无 Asynchronous scheduling is enabled
+
+搜 will be disabled
+
+查看具体禁用原因
+
+按 B.关键配置 调整参数
+
+搜 Asynchronous scheduling is disabled
+
+显式传了 --no-async-scheduling
+移除该参数即可
+
+检查日志级别
+可能 INFO 日志被过滤
+
+F.2 KV 传输故障
+无
+
+有
+
+有
+
+是
+
+否
+
+无
+
+请求卡在 WAITING_FOR_REMOTE_KVS
+
+有 Finished recving KV transfer?
+
+远端 KV 未到达
+
+检查 NIXL/Mooncake connector 状态
+
+有 KV load failure?
+
+Recovered?
+
+自动恢复，观察频率
+
+failure_policy=fail
+请求被终止
+
+其他原因卡住
+检查 token_budget/running_count
+
+F.3 Recompute 抢占异常（vLLM-Ascend 专用）
+启用了
+
+offload enabled
+
+falls back
+
+未启用
+
+频繁 [RecomputeScheduler] Preempted
+
+offload 是否启用?
+
+offload enabled?
+还是 falls back?
+
+正常，KV cache 压力大
+考虑增加 NPU 显存或减少并发
+
+Offload 不可用
+检查 KV connector 配置
+
+纯 Recompute 模式
+频繁触发考虑扩容
+
+Recompute triggered
+请求送回 PD Proxy
+
