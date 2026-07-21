@@ -1,0 +1,87 @@
+特性大类	特性小类	Maintainer+预备Maintainer							PL组
+attn arch	GQA	赵可瑞	郭小辉	陈歆怡					陈歆怡
+	MLA	袁林风	毛琦						游致远
+	DSA	朱意霖	温捷						游致远
+	SFA	陈梦龙	毛琦	李佳航					游致远
+	Mamba	龙钢	李少鹏						蓝王力
+attn feature/长序列	prefixcache	曹梦晴	胡聪	李家琦					杨健
+	PCP	魏桂华	邱纯硕	田馥玮					甄文奇
+	DCP	魏桂华	邱纯硕	田馥玮					甄文奇
+	CPP	魏桂华	邱纯硕	田馥玮					甄文奇
+KVConnector	PD分离	周学荣	王啸腾						杨健
+	池化	赵鹏博	房建伟						杨健
+	kv offloading	曹梦晴	王小超						杨健
+	multi-connector	赵鹏博	房建伟						杨健
+KVCache	kvcache管理	曹梦晴	曾彦嘉	周学荣					甄文奇
+graph	aclgraph	刘逸舟	柯展	付豪					杨健
+	npugraph_ex	刘逸舟	柯展	付豪					杨健
+	compile/pass	王笑爽	刘逸舟	付豪					杨健
+spec decode	mtp/eagle3	李泽桐	王盈聪	刘逸舟					甄文奇
+	ngram	李泽桐	王盈聪						甄文奇
+	suffix-decoding	李泽桐	王盈聪						甄文奇
+	d-flash	李泽桐	王盈聪	刘逸舟					甄文奇
+	p-eagle	李泽桐	李林斯曼	王盈聪					甄文奇
+schedule	async scheduling	田馥玮	夏迎庆	刘荣					纪涛
+	DPLB	姜凯强	彭晓						纪涛
+	请求级调度优化	姜凯强	王恒康						纪涛
+features	multilora	耿力							陈歆怡
+	EPLB	曾彦嘉	田馥玮						甄文奇
+	flashcomm	刘家旭	李家琦	温捷					纪涛
+	layersharding	蚂蚁cangzhuo							
+	O矩阵tp切分	毛琦	胡聪						杨健
+	mlp tp切分	毛琦	徐驰						陈歆怡
+	olora tp切分	毛琦	温捷						
+	Embedding TP/lm head tp切分	毛琦	徐驰						
+	multistream_moe	曾彦嘉	韩俊						
+	绑核	邹易达	陈楚未						杨健
+	权重offload技术	王小超	王恒康						
+	weight nz	温捷	魏瑾谦						
+quantization	量化框架	王锟鹏	余林峰	温捷	赵枫霖				余登高
+	linear量化	王锟鹏	余林峰	温捷					余登高
+	fusedmoe量化	王锟鹏	余林峰	温捷					余登高
+	kvcache量化	王锟鹏	马宇蒙	温捷					余登高
+sampling	后采样	田馥玮	邹宗毓						纪涛
+	拒绝采样	李一诗	王恒康	田馥玮					纪涛
+layers	rope	曾彦嘉	衡建宇						
+	norm	曾彦嘉	衡建宇						
+	embedding	王玺源	徐驰						陈歆怡
+	linear	魏瑾谦	宗浩鑫						陈歆怡
+	fused_moe	魏谨谦	袁林风	王笑爽					
+分布式	TP/EP/DP/PP	温捷	王子岳						陈歆怡
+	通信域管理	温捷	宗浩鑫	毛琦					陈歆怡
+算子	算子编译	毛琦	曾天						陈龙
+	torch binding	毛琦	曾天						陈龙
+	ascendC算子	陈龙	毛琦	韩俊					陈龙
+	triton算子	陈龙	毛琦	韩俊					陈龙
+	device_op	陈龙	毛琦	韩俊					陈龙
+模型	多模态理解	龙钢	李少鹏						蓝王力
+	语音/全模态	陈睿龙	连斌						蓝王力
+	embedding模型	郭小辉							
+边端	310p	程少旭	王恒康						牛诗雅
+RL	sleep mode	刘荣、魏瑾谦、杨锦阳							纪涛
+	Batch一致性&训推一致								刘哲续
+	异步RL的pause/resume								刘哲续
+	dp感知router								纪涛
+	token in/token out								纪涛
+	extract hidden states								纪涛
+	HCCL/IPC权重传输								纪涛
+	external launcher								刘哲续
+	RL lora权重更新								刘哲续
+	tool call								刘哲续
+公共	日志	胡心仪	李忠洋						王洋
+	权重加载	徐驰	韩俊						陈歆怡
+	warmup	刘逸舟	柯展						
+	dummy_run	刘逸舟	柯展						
+	prepare inputs	刘逸舟	柯展						
+	platform	王玺源							
+	patch	王玺源	韩俊	温捷					韩俊
+	reasoning/structured output	温劲	林炜	冀元祎					
+	function call	冀元祎							
+	model_runner_v2	温捷	邹宗毓	刘逸舟	甄文奇	刘荣			纪涛
+	agent/skills	毛琦	曾浩龙						杨健
+对外接口	additional_config	韩俊	温捷						韩俊
+	envs_ascend	韩俊	温捷						韩俊
+文档	quick start/installation	张新悦	康宇昕	刘国琴					
+	tutorial	陈歆怡/蓝王力/游致远	康宇昕	刘国琴					
+	user guide	杨健	康宇昕	刘国琴					杨健
+	developer guide	甄文奇	康宇昕	刘国琴					
