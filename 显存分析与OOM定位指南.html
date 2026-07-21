@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<title>显存分析与 OOM 定位指南</title>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'default', flowchart: { htmlLabels: true, curve: 'basis' } });
+</script>
+<style>
+body{font-family:'Noto Sans SC','Segoe UI',sans-serif;max-width:1100px;margin:0 auto;padding:2rem;line-height:1.75;color:#222}
+h1{text-align:center} h2{color:#1a73e8;border-bottom:2px solid #1a73e8;padding-bottom:.3rem;margin-top:2.2rem}
+h3{margin-top:1.4rem;border-left:3px solid #1a73e8;padding-left:.5rem}
+.card{border:1px solid #e0e0e0;border-radius:8px;padding:1rem;margin:1rem 0;overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:.88rem} th,td{border-bottom:1px solid #eee;padding:6px 8px;text-align:left}
+th{background:#f5f5f5} .note{color:#666;font-size:.85rem} .callout{background:#e8f0fe;border-left:4px solid #1a73e8;padding:.8rem 1rem;margin:1rem 0}
+.mermaid{background:#fafafa;border:1px solid #eee;border-radius:8px;padding:1rem;margin:1rem 0}
+code{background:#f5f5f5;padding:1px 5px;border-radius:3px}
+a{color:#1a73e8}
+</style></head><body>
+<h1>显存分析与 OOM 定位指南</h1>
+<p class="note" style="text-align:center">浏览器打开本页即可渲染流程图 · 配套模型报告：
+<a href="./MiniMax-M2.7-w8a8-QuaRot-analysis-report.html">MiniMax-M2.7-w8a8-QuaRot-analysis-report.html</a>
+· Markdown 源：<a href="./显存分析与OOM定位指南.md">显存分析与OOM定位指南.md</a></p>
+
+<div class="callout">
+<b>为何 Markdown 里“看不到图”</b>：附录 D/F 的流程图写在 <code>```mermaid</code> 代码块中，Cursor 预览/纯文本查看默认不渲染。
+请用浏览器打开本 HTML；或安装 Markdown Mermaid 预览插件。
+</div>
+
+<h2>一、快速定位口诀</h2>
+<div class="card"><table>
+<tr><th>步骤</th><th>grep 关键字</th><th>阶段</th></tr>
+<tr><td>1</td><td>desired GPU memory utilization</td><td>启动预算</td></tr>
+<tr><td>2</td><td>Loading model weights took</td><td>权重加载</td></tr>
+<tr><td>3</td><td>Available KV cache memory</td><td>profiling / KV</td></tr>
+<tr><td>4</td><td>After warmup: torch reserved</td><td>warmup 基线（锚点 A）</td></tr>
+<tr><td>5</td><td>out of memory</td><td>推理 OOM</td></tr>
+<tr><td>6</td><td>总空闲够但连续块不够</td><td>碎片型 → 采 snapshot</td></tr>
+</table></div>
+
+<h2>二、版本对比（正常 vs 推理 OOM）</h2>
+<ol>
+<li>对齐配置拉起两版本，在 <b>After warmup</b> 打印 reserved / allocated / Available KV（锚点 A）</li>
+<li>首请求 Prefill 前（锚点 B）、Prefill 后/Decode 前（锚点 C）再打印</li>
+<li>对 Delta 最大窗口 <code>echo 1/0</code> 采 snapshot；若疑似碎片再跑 Excel 解析</li>
+</ol>
+
+<h2>三、全量流程图（Mermaid 渲染）</h2>
+<h3>D.1 启动与显存预算</h3>
+<div class="mermaid">
+flowchart TD
+  A[进程启动 / set_device] --> B[MemorySnapshot init]
+  B --> C{free >= total x gpu_memory_utilization?}
+  C -->|否| D[ValueError 启动失败]
+  C -->|是| E[分布式初始化 / Worker 就绪]
+</div>
+<h3>D.2 权重加载</h3>
+<div class="mermaid">
+flowchart TD
+  A[load_model] --> B{量化路径}
+  B -->|ascend W8A8 QuaRot| C[INT8 权重 + scale]
+  B -->|误走 BF16/未量化| D[单卡权重接近 BF16 估算]
+  C --> E[Loading model weights took X GB]
+  D --> E
+  E --> F{加载中 OOM?}
+  F -->|是| G[查 TP/EP/量化]
+  F -->|否| H[进入 profiling]
+</div>
+<h3>D.3 profiling 与 KV 预算</h3>
+<div class="mermaid">
+flowchart TD
+  A[determine_available_memory] --> B{kv_cache_memory_bytes 已指定?}
+  B -->|是| C[profile_run 仅编译 / 跳过测算]
+  B -->|否| D[memory_profiling + profile_run]
+  D --> E[weights + peak_act + non_torch]
+  E --> F[available_kv = requested - non_kv]
+  F --> G[Available KV cache memory: X GiB]
+</div>
+<h3>D.4 warmup 与 After warmup 基线</h3>
+<div class="mermaid">
+flowchart TD
+  A[分配 KV 池] --> B[compile / dummy_run]
+  B --> C[capture_model 可选]
+  C --> D[打印 weights/peak/non_torch/graph]
+  D --> E[After warmup reserved / allocated]
+  E --> F[服务 ready = 锚点 A]
+</div>
+<h3>D.5 推理 OOM：正常版 vs 异常版对比</h3>
+<div class="mermaid">
+flowchart TD
+  A[两版本对齐配置拉起] --> B[锚点 A: warmup 结束 dump_mem]
+  B --> C{A 点 reserved/allocated 接近?}
+  C -->|否| D[回查权重/图/HCCL 非 Torch]
+  C -->|是| E[锚点 B: 推理 execute 前]
+  E --> F[锚点 C: Prefill 后 / Decode 前]
+  F --> G{哪段 Delta 最大?}
+  G -->|B到C 激活| H[对该窗口 snapshot]
+  G -->|KV/调度| I[查 block 使用率 / preempt]
+  G -->|reserved升 且碎片| J[碎片解析]
+  H --> K[MindStudio Insight / memory_viz 看栈]
+</div>
+<h3>D.6 Snapshot 启停</h3>
+<div class="mermaid">
+flowchart TD
+  A[创建 enable_snapshot=0 与 memlog] --> B[Worker 启动 SnapshotMonitor]
+  B --> C[echo 1 开始记录]
+  C --> D[复现 Prefill/Decode/OOM 前窗口]
+  D --> E[echo 0 dump pickle]
+  E --> F{目标}
+  F -->|调用栈/峰值| G[Insight / memory_viz]
+  F -->|碎片| H[analyze_snapshot 到 Excel]
+</div>
+<h3>F.2 推理期 OOM（版本对比）</h3>
+<div class="mermaid">
+flowchart TD
+  A[ready 后 OOM] --> B[对比锚点 A]
+  B --> C{A 已分叉?}
+  C -->|是| D[静态水位问题]
+  C -->|否| E[对比 B/C 找增长段]
+  E --> F[snapshot 该段]
+  F --> G{最大连续空闲够吗?}
+  G -->|不够| H[碎片型 OOM]
+  G -->|够但仍 OOM| I[峰值激活/泄漏/驱动限制]
+</div>
+<h3>F.3 碎片型 OOM</h3>
+<div class="mermaid">
+flowchart TD
+  A[报分配失败且总 free 不小] --> B[确认 expandable_segments]
+  B --> C[复现前 echo 1 采 snapshot]
+  C --> D[解析碎片数量/最大碎片]
+  D --> E{最大碎片 << 请求 size?}
+  E -->|是| F[碎片确认: 减并发/查未释放临时张量]
+  E -->|否| G[回到峰值/泄漏路径]
+</div>
+
+<h2>四、MiniMax-M2.7-w8a8-QuaRot 显存摘要</h2>
+<div class="card"><table>
+<tr><th>指标</th><th>数值</th></tr>
+<tr><td>总参 / 激活</td><td>228.7B / 11.03B</td></tr>
+<tr><td>KV INT8</td><td>124 KiB/token</td></tr>
+<tr><td>TP4DP4 W8A8 单卡权重</td><td>≈17.28 GB</td></tr>
+<tr><td>TP8 W8A8 单卡权重</td><td>≈30.98 GB</td></tr>
+</table>
+<p class="note">完整表格与选型见分析报告 HTML。</p></div>
+
+<h2>五、何时采集显存碎片</h2>
+<ul>
+<li><b>必须采</b>：碎片型 OOM；reserved≫allocated 后大 alloc 失败；版本对比仅推理窗口分叉且 segment_map 增多</li>
+<li><b>可先不采</b>：启动预算失败；权重加载期已顶满；Available KV 明显过小</li>
+</ul>
+
+<p class="note">详细日志表、SnapshotMonitor 代码、碎片判读见 Markdown 全文。</p>
+</body></html>
