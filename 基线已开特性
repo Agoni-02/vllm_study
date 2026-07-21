@@ -1,0 +1,24 @@
+| 特性大类 | 特性小类 | 基线开关 | 实际状态 |
+|---|---|---|---|
+| schedule | async scheduling | `--async-scheduling` | 已开 |
+| spec decode | mtp/eagle3 | `--speculative-config method=qwen3_5_mtp` | 已开 |
+| features | multilora | `--enable-lora` + `--lora-modules` | 已开 |
+| features | 绑核 | `enable_cpu_binding=true` | 已开 |
+| features | weight nz | `enable_weight_nz_layout` + `VLLM_ASCEND_ENABLE_NZ=1` | 已开 |
+| features | multistream_moe | `multistream_overlap_shared_expert=true` | 配置有，与 `FUSED_MC2=1` 互斥，实际会被关掉 |
+| 分布式 | TP/EP/DP/PP（TP） | `--tensor-parallel-size 4` | 已开 |
+| layers | fused_moe（fused MC2） | `VLLM_ASCEND_ENABLE_FUSED_MC2=1` | 已开 |
+| attn arch | Mamba（GDN） | `VLLM_ASCEND_GDN_*` | 已开 |
+| 模型 | 多模态理解 | `--allowed-local-media-path` / `--mm_processor_cache_*` | 已开 |
+| 对外接口 | additional_config | `--additional-config` | 已开 |
+| 对外接口 | envs_ascend | `VLLM_ASCEND_*` 等环境变量 | 已开 |
+
+补充（不算“已开特性”）：
+
+配置项	说明
+compilation-config FULL_DECODE_ONLY
+有配置，但 --enforce-eager 使 graph 未生效
+VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE
+已废弃，不计入有效特性
+VLLM_ASCEND_ENABLE_PREFETCH_MLP
+dense prefetch 优化，特性表无独立小类
