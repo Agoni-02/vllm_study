@@ -1,4 +1,4 @@
---additional-config '{
+{
   "enable_cpu_binding": true,
   "multistream_overlap_shared_expert": true,
   "enable_weight_nz_layout": true,
@@ -8,5 +8,6 @@
     "enable_entropy_verify": true,
     "posterior_threshold": 0.95,
     "posterior_alpha": 0.4
-  }
-}'
+  },
+  "enable_balance_scheduling": true
+}
