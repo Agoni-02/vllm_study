@@ -1,0 +1,782 @@
+显存快照（snapshot）分析与使用
+2026-07-03 15:45 由 耿力 00887675 创建，于 2026-07-13 17:15 由 朱勇亮 50058403 最后修改。 内容存疑 点我
+背景
+出现以下问题时可以借助snapshot进行显存分析：
+
+显存 OOM。瞬时峰值 OOM：批量请求、长文本、大 batch 瞬间申请超大显存，直接超出容器 / 卡显存上限，进程被 OOM Killer 杀死；碎片型 OOM：整体预留显存充足，但连续大块空闲内存不足，大量细碎空泡，明明总空闲很大，但无法分配连续大张量，抛出 NPU 内存分配失败报错。
+内存碎片。reserved 总预留显存很高，但有效可用连续内存少；大量零散 inactive 空闲块，小 alloc 能复用碎片，大张量分配直接失败；推理吞吐下降、频繁触发内部重分配，性能变差。
+不合理 Segment 分段浪费。大量小 segment，每个 segment 预留大片空间但实际使用极少；多 stream、多 DP 创建独立内存段，段之间无法互相复用空闲内存，整体预留膨胀。
+重复分配 / 临时张量未回收。推理循环内重复创建临时张量、算子中间缓存，没有及时释放；短时间海量 alloc，瞬间拉高显存水位。
+显存泄漏。推理持续跑，已占用显存持续单向上涨，空载 / 低并发也不会回落；反复请求后显存只增不减，最终缓慢触发 OOM。
+1.snapshot介绍
+内存快照（Memory Snapshot）工具提供了细粒度的 GPU 内存可视化，用于调试 GPU OOM 问题。捕获的内存快照会显示内存事件，包括分配、释放和 OOM，以及它们的堆栈跟踪信息。
+
+
+
+这是一个示例图片，通过导出运行过程中的显存文件.pickle，在docs.pytorch.org/memory_viz网站上可视化解析可以得到以上图片。从图片中可以观察到很多信息，在Allocator State History这个页面包括显存事件（segment_map、segment_unmap、alloc、free）、每个事件的调用栈、事件对应的显存大小和当时的reserved值和allocated值，allocated值等。其中segment_map操作会使reserved值增大，segment_unmap会降低reserved值。图片中的彩色条是很多blcok，放大可以看到其中空白的block是显存碎片，由segment_map、free事件产生。
+
+
+
+也可以将.pickle文件导入，通过MindStudio Insight进行分析，这个工具易用性更好一点，当pickle文件较大时在内存块中选中分配事件不会出现卡顿，但是导入时间也会变长，并且要求版本号是26.1.0及之上
+
+2.pickle文件导出
+以下脚本可用来导出snapshot可视化和解析需要的pickle文件，可以在需要采集snapshot的位置前方或者脚本开头加上class SnapshotMonitor这个类，方便后续调用。
+import os
+import time
+import random
+import threading
+import torch
+from vllm.logger import logger
+
+class SnapshotMonitor:
+    def __init__(
+        self,
+        local_rank: int,
+        dp: int = -1,
+        flag_file: str = "/home/enable_snapshot",
+        interval: float = 0.5,
+        # 新增可自定义保存目录参数，默认/home/memlog向下兼容
+        save_dir: str = "/home/memlog",
+    ):
+        self.local_rank = local_rank
+        self.flag_file = flag_file
+        self.interval = interval
+        self.save_dir = save_dir
+
+        self._stop_event = threading.Event()
+        self._thread = None
+
+        # 当前是否正在记录snapshot
+        self._recording = False
+
+        self.count = 0
+        self.dp = dp
+
+    def start(self):
+        if self._thread is not None:
+            return
+
+        self._thread = threading.Thread(
+            target=self._monitor_loop,
+            daemon=True,
+            name="snapshot-monitor",
+        )
+        self._thread.start()
+
+        logger.info(
+            "Snapshot monitor started, watching %s, snapshot save dir: %s",
+            self.flag_file,
+            self.save_dir,
+        )
+
+    def stop(self):
+        if self._thread is None:
+            return
+
+        self._stop_event.set()
+        self._thread.join(timeout=5)
+
+    def _read_flag(self) -> bool:
+        try:
+            with open(self.flag_file, "r") as f:
+                return f.read().strip() == "1"
+        except Exception:
+            return False
+
+    def _start_record(self):
+        if self._recording:
+            return
+
+        logger.info("Enable snapshot, start record memory history")
+        torch.npu.memory._record_memory_history()
+        self._recording = True
+
+    def _stop_record(self):
+        if not self._recording:
+            return
+
+        rand = random.randint(1, 100000)
+        self.count += 1
+        # 拆分文件名，用自定义save_dir拼接完整路径
+        file_name = (
+            f"vllm_snapshot_dp{self.dp}_rank{self.local_rank}_count{self.count}"
+            f".rand{rand}.pickle"
+        )
+        tmpfile = os.path.join(self.save_dir, file_name)
+
+        # 自动创建目录，多级目录、已存在均无报错
+        os.makedirs(self.save_dir, exist_ok=True)
+
+        logger.info(
+            "Enable snapshot, save memory history to: %s",
+            tmpfile,
+        )
+        try:
+            torch.npu.memory._dump_snapshot(tmpfile)
+        finally:
+            torch.npu.memory._record_memory_history(enabled=None)
+            self._recording = False
+
+    def _monitor_loop(self):
+        last_state = self._read_flag()
+
+        # 如果启动时文件已经是1，直接开始记录
+        if last_state:
+            self._start_record()
+
+        while not self._stop_event.is_set():
+            try:
+                current_state = self._read_flag()
+
+                # 0 -> 1
+                if not last_state and current_state:
+                    self._start_record()
+
+                # 1 -> 0
+                elif last_state and not current_state:
+                    self._stop_record()
+
+                last_state = current_state
+
+            except Exception:
+                logger.exception("Snapshot monitor error")
+
+            self._stop_event.wait(self.interval)
+123456789101112131415161718192021222324252627
+其中 /home/enable_snapshot是后台守护线程轮询标志文件，开始时需置0，文件内容为1开启显存历史记录，文件变为0自动 dump pickle 快照并停止记录。通过每隔interval秒对这个文件的读写可以进行显存快照的开启与关闭导出，其中interval是线程轮询文件间隔，默认 0.5 秒，若进程时间过短，需调整此处的interval。导出的pickle文件位于拉起服务同级目录下的memlog中。
+
+以vllm_ascend/worker/worker.py文件为例，在vLLM worker 初始化时加入这段代码，后台监控线程默默启动，每 0.5s 读一次 /home/enable_snapshot。
+        self.snapshot_monitor = SnapshotMonitor(
+            local_rank=local_rank,
+            dp=self.parallel_config.data_parallel_rank,
+            flag_file="/home/enable_snapshot",
+            interval=0.5,
+            save_dir="/home/npu_memory_snapshot",  # 用户自定义脚本保存路径
+            
+        )
+        self.snapshot_monitor.start()
+
+
+
+ 
+
+2.1 pickle文件采集示例（推理阶段手动改）
+首先在拉起服务脚本的同级目录下创建memlog文件夹，用来存放导出的pickle文件，创建/home/enable_snapshot文件并置0。拉起服务后，发送请求前输入echo 1 > /home/enable_snapshot开启显存快照采集，此时拉起服务页面会打屏Enable snapshot, start record memory history，接着发送请求，在有返回值时候输入echo 0 > /home/enable_snapshot，即可保存快照文件至拉服务同级目录下的memlog文件中。
+
+
+
+文件名带上 dp 编号，方便区分不同数据并行组产生的内存分配日志；rank1 对应 1号卡内存 trace；count2同一进程、同一张卡、同一个 DP 组，多次启停快照时，生成序号递增的文件，不会覆盖上一轮内存记录；随机数后缀保证同一 count 下也不会重名
+
+2.2 pickle文件采集示例（warmup阶段）
+首先在拉起服务脚本的同级目录下创建memlog文件夹，用来存放导出的pickle文件，创建/home/enable_snapshot文件并置0。通过这种写入1/0的方法可以不用手动改。
+
+
+
+在with memory_profiling的前后进行开启和关闭保存快照
+
+ 
+
+3.pickle文件解析显存碎片
+导出后的pickle文件可以通过MindStudio Insight和docs.pytorch.org/memory_viz网站进行可视化分析，也可以通过以下脚本进行
+
+显存中出现较多碎片时，统计显存碎片的大小和地址
+segment_map会因显存的碎片空间不够alloc进行扩张，找到内联关系
+通过以下脚本解析pickle文件，可以弥补网页可视化上的这些不足
+import pickle
+import os
+import pandas as pd
+
+def format_size(b):
+    if b is None:
+        return "N/A"
+    if b < 1024:
+        return f"{b} B"
+    elif b < 1024 * 1024:
+        return f"{b / 1024:.2f} KiB"
+    else:
+        return f"{b / (1024 * 1024):.2f} MiB"
+
+def format_addr(addr):
+    if isinstance(addr, int):
+        return f"0x{addr:x}"
+    return str(addr)
+
+class BubbleTracker:
+    """通过重放 allocator 事件，跟踪 inactive 碎片（空闲可复用块）。"""
+
+    def __init__(self):
+        self.bubbles = []
+
+    @staticmethod
+    def _merge(bubbles):
+        if not bubbles:
+            return []
+        bubbles = sorted(bubbles, key=lambda x: x[0])
+        merged = [bubbles[0]]
+        for addr, size in bubbles[1:]:
+            prev_addr, prev_size = merged[-1]
+            if prev_addr + prev_size == addr:
+                merged[-1] = (prev_addr, prev_size + size)
+            else:
+                merged.append((addr, size))
+        return merged
+
+    def _consume(self, addr, size):
+        end = addr + size
+        result = []
+        for b_addr, b_size in self.bubbles:
+            b_end = b_addr + b_size
+            if b_end <= addr or b_addr >= end:
+                result.append((b_addr, b_size))
+            else:
+                if b_addr < addr:
+                    result.append((b_addr, addr - b_addr))
+                if b_end > end:
+                    result.append((end, b_end - end))
+        self.bubbles = self._merge(result)
+
+    def _add(self, addr, size):
+        self.bubbles = self._merge(self.bubbles + [(addr, size)])
+
+    def _remove_segment(self, seg_addr, seg_size):
+        seg_end = seg_addr + seg_size
+        result = []
+        for b_addr, b_size in self.bubbles:
+            b_end = b_addr + b_size
+            if b_end <= seg_addr or b_addr >= seg_end:
+                result.append((b_addr, b_size))
+            else:
+                if b_addr < seg_addr:
+                    result.append((b_addr, seg_addr - b_addr))
+                if b_end > seg_end:
+                    result.append((seg_end, b_end - seg_end))
+        self.bubbles = self._merge(result)
+
+    def apply_event(self, action, addr, size):
+        if action in ('segment_alloc', 'segment_map'):
+            self._add(addr, size)
+        elif action == 'alloc':
+            self._consume(addr, size)
+        elif action in ('free_completed', 'free'):
+            self._add(addr, size)
+        elif action == 'segment_free':
+            self._remove_segment(addr, size)
+
+    def snapshot(self):
+        """按地址升序返回碎片，便于与内存图对齐。"""
+        bubbles = sorted(self.bubbles, key=lambda x: x[0])
+        total = sum(size for _, size in bubbles)
+        max_size = max((size for _, size in bubbles), default=0)
+        return {
+            'count': len(bubbles),
+            'total_size': total,
+            'max_size': max_size,
+            'bubbles': bubbles,
+        }
+
+ACTION_DISPLAY = {
+    'segment_alloc': 'segment_map',
+    'segment_map': 'segment_map',
+    'alloc': 'alloc',
+    'free_completed': 'free',
+    'free': 'free',
+}
+
+def normalize_action(action):
+    return ACTION_DISPLAY.get(action)
+
+def find_segment_end(addr, segments):
+    for seg_addr, seg_size in segments:
+        if seg_addr <= addr < seg_addr + seg_size:
+            return seg_addr + seg_size
+    return None
+
+def infer_alloc_block_size(addr, requested_size, events, cur_idx, segments):
+    """PyTorch 按块对齐分配；用同 segment 内下一地址边界推断实际占用大小。"""
+    seg_end = find_segment_end(addr, segments)
+    next_addrs = []
+    for e in events[cur_idx + 1:]:
+        next_addr = e.get('addr', 0)
+        if next_addr <= addr:
+            continue
+        if seg_end is not None and next_addr >= seg_end:
+            continue
+        if e.get('action') in ('alloc', 'free_completed', 'segment_alloc', 'segment_map'):
+            next_addrs.append(next_addr)
+    if next_addrs:
+        block_size = min(next_addrs) - addr
+        if block_size >= requested_size:
+            return block_size
+    return requested_size
+
+def _seg_end(seg):
+    return seg['addr'] + seg['size']
+
+def _map_segment(segments, merge, seg):
+    idx = next((i for i, s in enumerate(segments) if s['addr'] > seg['addr']), -1)
+    if not merge:
+        insert_at = len(segments) if idx == -1 else idx
+        segments.insert(insert_at, dict(seg))
+        return
+    if idx == -1:
+        idx = len(segments)
+    segments.insert(idx, dict(seg))
+    if idx + 1 < len(segments):
+        nxt = segments[idx + 1]
+        if _seg_end(seg) == nxt['addr'] and seg['stream'] == nxt['stream']:
+            seg['size'] += nxt['size']
+            segments.pop(idx + 1)
+    if idx > 0:
+        prev = segments[idx - 1]
+        if _seg_end(prev) == seg['addr'] and prev['stream'] == seg['stream']:
+            prev['size'] += seg['size']
+            segments.pop(idx)
+
+def _unmap_segment(segments, merge, seg):
+    if not merge:
+        segments[:] = [s for s in segments if s['addr'] != seg['addr']]
+        return
+    seg_end = _seg_end(seg)
+    idx = next(
+        i for i, s in enumerate(segments)
+        if s['addr'] <= seg['addr'] and seg_end <= _seg_end(s)
+    )
+    existing = segments[idx]
+    existing_end = _seg_end(existing)
+    if existing['addr'] == seg['addr']:
+        existing['addr'] += seg['size']
+        existing['size'] -= seg['size']
+        if existing['size'] == 0:
+            segments.pop(idx)
+    elif existing_end == seg_end:
+        existing['size'] -= seg['size']
+    else:
+        existing['size'] = seg['addr'] - existing['addr']
+        remainder = {
+            'addr': seg_end,
+            'size': existing_end - seg_end,
+            'stream': existing['stream'],
+        }
+        segments.insert(idx + 1, remainder)
+
+def build_memory_view_initial_state(snapshot, device=0):
+    """从最终快照构建 memory_viz MemoryView 的初始 segments 与 block_map。"""
+    segments = []
+    block_map = {}
+    for seg in snapshot.get('segments', []):
+        if 'device' in seg and seg['device'] != device:
+            continue
+        segments.append({
+            'addr': seg['address'],
+            'size': seg['total_size'],
+            'stream': seg.get('stream', 0),
+        })
+        for b in seg.get('blocks', []):
+            state = b.get('state', '')
+            if state not in ('active_allocated', 'active_pending_free', 'active_awaiting_free'):
+                continue
+            addr = b.get('address')
+            block_map[addr] = {
+                'addr': addr,
+                'size': b.get('size', 0),
+                'requested_size': b.get('requested_size', b.get('size', 0)),
+                'free_requested': state in ('active_pending_free', 'active_awaiting_free'),
+            }
+    return segments, block_map
+
+def simulate_memory_at_event(snapshot, events, idx, device=0):
+    """
+    与 memory_viz MemoryView.simulate_memory(idx) + draw(idx) 一致：
+    从最终快照出发，撤销 idx 之后的 trace 事件，返回该操作执行后的 reserved/allocated。
+    """
+    init_segments, init_block_map = build_memory_view_initial_state(snapshot, device)
+    l_segments = [dict(s) for s in init_segments]
+    l_block_map = {k: dict(v) for k, v in init_block_map.items()}
+
+    for i in range(len(events) - 1, idx, -1):
+        event = events[i]
+        action = event.get('action', '')
+        addr = event.get('addr', 0)
+        size = event.get('size', 0)
+        stream = event.get('stream', 0)
+
+        if action == 'free':
+            l_block_map[addr] = {
+                'addr': addr,
+                'size': size,
+                'requested_size': size,
+                'free_requested': False,
+            }
+        elif action == 'free_requested':
+            if addr in l_block_map:
+                l_block_map[addr]['free_requested'] = False
+        elif action == 'free_completed':
+            l_block_map[addr] = {
+                'addr': addr,
+                'size': size,
+                'requested_size': size,
+                'free_requested': True,
+            }
+        elif action == 'alloc':
+            l_block_map.pop(addr, None)
+        elif action in ('segment_free', 'segment_unmap'):
+            _map_segment(l_segments, action == 'segment_unmap', {
+                'addr': addr, 'size': size, 'stream': stream,
+            })
+        elif action in ('segment_alloc', 'segment_map'):
+            _unmap_segment(l_segments, action == 'segment_map', {
+                'addr': addr, 'size': size, 'stream': stream,
+            })
+
+    reserved = sum(s['size'] for s in l_segments)
+    allocated = sum(b['requested_size'] for b in l_block_map.values())
+    return reserved, allocated
+
+def bootstrap_segments_from_snapshot(snapshot, events):
+    final = {(s.get('address'), s.get('total_size')) for s in snapshot.get('segments', [])}
+    added = set()
+    removed = set()
+    for e in events:
+        action = e.get('action')
+        if action in ('segment_alloc', 'segment_map'):
+            added.add((e.get('addr'), e.get('size')))
+        elif action == 'segment_free':
+            removed.add((e.get('addr'), e.get('size')))
+    return list((final - added) | removed)
+
+def compute_trace_bootstrap(snapshot, events):
+    """碎片跟踪仍从 0 正向重放，需 baseline 补 history 启用前的 segment。"""
+    final_segments = bootstrap_segments_from_snapshot(snapshot, events)
+    return {'segments': final_segments}
+
+def build_bubble_table_row(seq, display_action, addr, size, bubble_stats, reserved, allocated):
+    row = {
+        '序号': seq,
+        '类型': display_action,
+        '地址': format_addr(addr),
+        '大小（格式化）': format_size(size),
+        'reserved': format_size(reserved),
+        'allocated': format_size(allocated),
+        '碎片数量': bubble_stats['count'],
+        '碎片总大小': format_size(bubble_stats['total_size']) if bubble_stats['count'] else '',
+        '最大碎片大小': format_size(bubble_stats['max_size']) if bubble_stats['count'] else '',
+    }
+    for i, (b_addr, b_size) in enumerate(bubble_stats['bubbles'], start=1):
+        row[f'碎片{i}大小'] = format_size(b_size)
+        row[f'碎片{i}地址'] = format_addr(b_addr)
+    return row
+
+def build_bubble_table_columns(max_bubble_count):
+    columns = [
+        '序号', '类型', '地址', '大小（格式化）',
+        'reserved', 'allocated',
+        '碎片数量', '碎片总大小', '最大碎片大小',
+    ]
+    for i in range(1, max_bubble_count + 1):
+        columns.extend([f'碎片{i}大小', f'碎片{i}地址'])
+    return columns
+
+def analyze_snapshot(file_path, output_file="memory_analysis.xlsx"):
+    print(f"正在分析: {file_path}")
+    print(f"文件大小: {format_size(os.path.getsize(file_path))}")
+    print("=" * 80)
+
+    with open(file_path, 'rb') as f:
+        snapshot = pickle.load(f)
+
+    print(f"\n快照结构:")
+    for key in snapshot.keys():
+        value = snapshot[key]
+        if isinstance(value, list):
+            print(f"  {key}: {type(value).__name__} (长度={len(value)})")
+        elif isinstance(value, dict):
+            print(f"  {key}: {type(value).__name__} (键数量={len(value)})")
+        else:
+            print(f"  {key}: {type(value).__name__}")
+
+    bubble_table_data = []
+    segments_data = []
+    blocks_data = []
+    bubbles_data = []
+
+    total_segment_size = 0
+    total_allocated_size = 0
+    total_active_size = 0
+    total_inactive_size = 0
+
+    if 'segments' in snapshot:
+        print("\n" + "=" * 80)
+        print("内存段(Segments)分析")
+        print("=" * 80)
+
+        for i, seg in enumerate(snapshot['segments']):
+            seg_type = seg.get('segment_type', 'unknown')
+            addr = seg.get('address', 'unknown')
+            total_size = seg.get('total_size', 0)
+            allocated_size = seg.get('allocated_size', 0)
+            active_size = seg.get('active_size', 0)
+            inactive_size = total_size - active_size
+            stream = seg.get('stream', 'unknown')
+            blocks = seg.get('blocks', [])
+
+            total_segment_size += total_size
+            total_allocated_size += allocated_size
+            total_active_size += active_size
+            total_inactive_size += inactive_size
+
+            addr_str = format_addr(addr)
+
+            segments_data.append({
+                '段索引': i,
+                '段类型': seg_type,
+                '地址': addr_str,
+                '总大小(格式化)': format_size(total_size),
+                '总大小(字节)': total_size,
+                '已分配(格式化)': format_size(allocated_size),
+                '已分配(字节)': allocated_size,
+                '活跃(格式化)': format_size(active_size),
+                '活跃(字节)': active_size,
+                '碎片(格式化)': format_size(inactive_size),
+                '碎片(字节)': inactive_size,
+                '碎片率': f"{inactive_size / total_size * 100:.2f}%" if total_size > 0 else "N/A",
+                '流': stream,
+                '块数量': len(blocks)
+            })
+
+            print(f"\n  段 {i} ({seg_type}):")
+            print(f"    地址: {addr_str}")
+            print(f"    流: {stream}")
+            print(f"    总大小: {format_size(total_size)}")
+            print(f"    已分配: {format_size(allocated_size)}")
+            print(f"    活跃: {format_size(active_size)}")
+            print(f"    空闲(碎片): {format_size(inactive_size)}")
+            print(f"    块数量: {len(blocks)}")
+
+            for j, block in enumerate(blocks):
+                block_size = block.get('size', 0)
+                state = block.get('state', 'unknown')
+                block_addr = block.get('address')
+                if block_addr is None:
+                    block_addr = addr if isinstance(addr, int) else 0
+                block_addr_str = format_addr(block_addr)
+                real_size = block.get('requested_size', 0)
+
+                blocks_data.append({
+                    '段索引': i,
+                    '块索引': j,
+                    '段类型': seg_type,
+                    '段地址': addr_str,
+                    '块地址': block_addr_str,
+                    '状态': state,
+                    '大小(格式化)': format_size(block_size),
+                    '大小(字节)': block_size,
+                    '真实大小(格式化)': format_size(real_size) if real_size > 0 else "N/A",
+                    '真实大小(字节)': real_size if real_size > 0 else 0
+                })
+
+                print(f"      块 {j}:")
+                print(f"        状态: {state}")
+                print(f"        大小: {format_size(block_size)}")
+                print(f"        地址: {block_addr_str}")
+                if real_size > 0 and real_size != block_size:
+                    print(f"        真实大小: {format_size(real_size)}")
+
+                if state == 'inactive':
+                    bubbles_data.append({
+                        '段索引': i,
+                        '块索引': j,
+                        '段类型': seg_type,
+                        '段地址': addr_str,
+                        '块地址': block_addr_str,
+                        '碎片大小(格式化)': format_size(block_size),
+                        '碎片大小(字节)': block_size
+                    })
+
+        print("\n" + "=" * 80)
+        print("内存段汇总")
+        print("=" * 80)
+        print(f"  总段数: {len(snapshot['segments'])}")
+        print(f"  总保留(Reserved): {format_size(total_segment_size)}")
+        print(f"  总已分配(Allocated): {format_size(total_allocated_size)}")
+        print(f"  总活跃(Active): {format_size(total_active_size)}")
+        print(f"  总碎片(Inactive): {format_size(total_inactive_size)}")
+        print(f"  碎片率: {total_inactive_size / total_segment_size * 100:.2f}%")
+
+    max_bubble_count = 0
+
+    if 'device_traces' in snapshot:
+        print("\n" + "=" * 80)
+        print("设备跟踪(Device Traces)分析")
+        print("=" * 80)
+
+        traces_list = snapshot['device_traces']
+        print(f"  跟踪列表长度: {len(traces_list)}")
+
+        for device_idx, trace_entry in enumerate(traces_list):
+            if not isinstance(trace_entry, list):
+                continue
+
+            events = trace_entry
+            print(f"\n  事件数量: {len(events)}")
+
+            print(f"\n    事件列表 (含碎片状态):")
+            print(f"    {'序号':<6} {'类型':<18} {'地址':<20} {'大小':<12} {'碎片数':<8} {'碎片总大小':<12} {'reserved':<12} {'allocated':<12}")
+            print(f"    {'-'*110}")
+
+            bootstrap = compute_trace_bootstrap(snapshot, events)
+
+            tracker = BubbleTracker()
+            segments = list(bootstrap['segments'])
+            seq = 0
+            table_seq = 0
+
+            for idx, event in enumerate(events):
+                action = event.get('action', 'unknown')
+                addr = event.get('addr', 0)
+                size = event.get('size', 0)
+
+                if action in ('segment_alloc', 'segment_map'):
+                    segments.append((addr, size))
+                elif action == 'segment_free':
+                    segments[:] = [(a, s) for a, s in segments if not (a == addr and s == size)]
+
+                effective_size = size
+                if action == 'alloc':
+                    effective_size = infer_alloc_block_size(addr, size, events, idx, segments)
+
+                tracker.apply_event(action, addr, effective_size)
+
+                running_reserved, running_allocated = simulate_memory_at_event(
+                    snapshot, events, idx, device=device_idx,
+                )
+
+                stats = tracker.snapshot()
+                max_bubble_count = max(max_bubble_count, stats['count'])
+
+                display_action = normalize_action(action)
+                if display_action:
+                    table_seq += 1
+                    bubble_table_data.append(
+                        build_bubble_table_row(
+                            table_seq, display_action, addr, size, stats,
+                            running_reserved, running_allocated,
+                        )
+                    )
+
+                seq += 1
+                addr_str = format_addr(addr)
+                print(
+                    f"    {seq:<6} {action:<18} {addr_str:<20} "
+                    f"{format_size(size):<12} {stats['count']:<8} {format_size(stats['total_size']):<12} "
+                    f"{format_size(running_reserved):<12} {format_size(running_allocated):<12}"
+                )
+
+    print("\n" + "=" * 80)
+    print("碎片详细分析 (最终快照状态)")
+    print("=" * 80)
+
+    if bubbles_data:
+        bubbles_data.sort(key=lambda x: x['碎片大小(字节)'], reverse=True)
+
+        print(f"\n  发现 {len(bubbles_data)} 个碎片:")
+        for bubble in bubbles_data:
+            print(f"    段{bubble['段索引']}块{bubble['块索引']}: {bubble['碎片大小(格式化)']}")
+            print(f"      段类型: {bubble['段类型']}")
+            print(f"      段地址: {bubble['段地址']}")
+            print(f"      块地址: {bubble['块地址']}")
+
+        print(f"\n  碎片大小分布:")
+        size_buckets = {
+            'tiny (<1KiB)': 0,
+            'small (1KiB-1MiB)': 0,
+            'medium (1MiB-10MiB)': 0,
+            'large (10MiB+)': 0
+        }
+        for bubble in bubbles_data:
+            size = bubble['碎片大小(字节)']
+            if size < 1024:
+                size_buckets['tiny (<1KiB)'] += 1
+            elif size < 1024 * 1024:
+                size_buckets['small (1KiB-1MiB)'] += 1
+            elif size < 10 * 1024 * 1024:
+                size_buckets['medium (1MiB-10MiB)'] += 1
+            else:
+                size_buckets['large (10MiB+)'] += 1
+
+        for bucket, count in size_buckets.items():
+            print(f"    {bucket}: {count} 个")
+
+        largest_bubble = bubbles_data[0]
+        print(f"\n  最大碎片: {largest_bubble['碎片大小(格式化)']} (段{largest_bubble['段索引']}块{largest_bubble['块索引']})")
+        print(f"  最小碎片: {format_size(bubbles_data[-1]['碎片大小(字节)'])} (段{bubbles_data[-1]['段索引']}块{bubbles_data[-1]['块索引']})")
+        avg_bubble_size = sum(b['碎片大小(字节)'] for b in bubbles_data) / len(bubbles_data)
+        print(f"  平均碎片大小: {format_size(avg_bubble_size)}")
+
+    else:
+        print("  未发现碎片")
+
+    print("\n" + "=" * 80)
+    print(f"正在导出Excel: {output_file}")
+    print("=" * 80)
+
+    table_columns = build_bubble_table_columns(max_bubble_count)
+    df_bubble_table = pd.DataFrame(bubble_table_data)
+
+    if not df_bubble_table.empty:
+        for col in table_columns:
+            if col not in df_bubble_table.columns:
+                df_bubble_table[col] = ''
+        df_bubble_table = df_bubble_table[table_columns]
+
+    if os.path.exists(output_file):
+        try:
+            os.remove(output_file)
+        except PermissionError:
+            print(f"警告: 无法删除旧文件 {output_file}，可能正在被其他程序打开")
+
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        df_bubble_table.to_excel(writer, sheet_name='碎片跟踪', index=False)
+
+        for sheet_name in writer.sheets:
+            worksheet = writer.sheets[sheet_name]
+            for col in worksheet.columns:
+                max_length = 0
+                for cell in col:
+                    if cell.value:
+                        max_length = max(max_length, len(str(cell.value)))
+                worksheet.column_dimensions[col[0].column_letter].width = min(max_length + 2, 50)
+
+    print(f"\nExcel文件已生成: {output_file}")
+    print(f"  工作表「碎片跟踪」共 {len(bubble_table_data)} 行")
+
+if __name__ == "__main__":
+    file_path = "warmup.pickle"
+
+    if not os.path.exists(file_path):
+        print(f"错误: 文件 {file_path} 不存在")
+        exit(1)
+
+    try:
+        analyze_snapshot(file_path)
+    except PermissionError:
+        print("\n错误: 无法写入文件，可能是 memory_analysis.xlsx 正在被其他程序打开")
+        print("请关闭 Excel 后重新运行脚本")
+将569行改为此脚本同级目录下的真实pickle文件名，解析出来的excel表格如下，其中空泡就是显存碎片（注：显存快照采集之前的显存碎片无法被统计，reserved值-allocated值即显存碎片总大小，此处开始时有350.79为已经存在的显存碎片，未统计进入）
+
+
+
+表格分析示例：
+
+segment_map申请680MB，即reserved值扩大680MB，是因为下一步alloc需要768MB，但当时的最大空泡（显存碎片）仅有384.03MB，若不扩张不够alloc操作需要的显存，故segment_map后出现779.14MB的显存碎片用来存放下一步的alloc需要的地址。
+
+
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
