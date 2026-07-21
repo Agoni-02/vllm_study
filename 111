@@ -1,0 +1,7 @@
+| 符号 | 含义 |
+|------|------|
+| K | 不量化、每卡常驻复制的那部分参数：embedding、lm_head、RMSNorm、QK Norm、MoE gate/bias 等（文档里按 BF16 计） |
+| attn | Attention 投影权重（q/k/v/o），可做 W8A8；在 TP 下按张量并行切开 |
+| TP | Tensor Parallel，注意力等非专家层按卡切分 |
+| Q_experts | 所有 routed expert 的权重量（MiniMax-M2.7 约 224.7B） |
+| EP | Expert Parallel，专家按卡切分；常见部署里 EP ≈ TP × DP |
