@@ -12,3 +12,5 @@
   "enable_balance_scheduling": true
 }
   --enable-prefix-caching \
+
+"scheduler_config":{"profiling_chunk_config":{"enabled":true}}
