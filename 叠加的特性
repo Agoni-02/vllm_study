@@ -14,3 +14,17 @@
   --enable-prefix-caching \
 
 "scheduler_config":{"profiling_chunk_config":{"enabled":true}}
+
+EPLB 不是单独开关，而是 EP + 动态均衡配置 一起开。
+
+环境变量
+增加 export DYNAMIC_EPLB=true
+--enable-expert-parallel
+additional-config：
+"eplb_config": {
+  "dynamic_eplb": true,
+  "expert_heat_collection_interval": 600,
+  "algorithm_execution_interval": 50,
+  "eplb_policy_type": 2,
+  "num_redundant_experts": 0
+}
